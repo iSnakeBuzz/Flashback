@@ -2,11 +2,6 @@ name: Build
 
 on:
   push:
-    # all branches
-    branches: [ 'master' ]
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*' ]
-  pull_request:
     branches: [ 'master' ]
 
 jobs:
