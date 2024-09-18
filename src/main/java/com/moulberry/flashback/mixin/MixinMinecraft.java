@@ -5,7 +5,6 @@ import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.mojang.authlib.yggdrasil.YggdrasilAuthenticationService;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.moulberry.flashback.Flashback;
-import com.moulberry.flashback.configuration.FlashbackConfig;
 import com.moulberry.flashback.exporting.ExportJob;
 import com.moulberry.flashback.exporting.ExportJobQueue;
 import com.moulberry.flashback.keyframe.handler.MinecraftKeyframeHandler;
@@ -15,6 +14,7 @@ import com.moulberry.flashback.exporting.PerfectFrames;
 import com.moulberry.flashback.playback.ReplayServer;
 import com.moulberry.flashback.ext.MinecraftExt;
 import com.moulberry.flashback.editor.ui.ReplayUI;
+import com.moulberry.flashback.visuals.AccurateEntityPositionHandler;
 import it.unimi.dsi.fastutil.floats.FloatUnaryOperator;
 import net.minecraft.CrashReport;
 import net.minecraft.ReportedException;
@@ -43,13 +43,12 @@ import net.minecraft.server.level.progress.ProcessorChunkProgressListener;
 import net.minecraft.server.level.progress.StoringChunkProgressListener;
 import net.minecraft.server.packs.repository.PackRepository;
 import net.minecraft.server.players.GameProfileCache;
+import net.minecraft.util.Mth;
 import net.minecraft.util.profiling.ProfilerFiller;
 import net.minecraft.world.TickRateManager;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.block.entity.SkullBlockEntity;
 import net.minecraft.world.level.storage.LevelStorageSource;
-import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -69,7 +68,6 @@ import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Mixin(Minecraft.class)
@@ -140,6 +138,10 @@ public abstract class MixinMinecraft implements MinecraftExt {
     @Nullable
     public Entity cameraEntity;
 
+    @Shadow
+    @Final
+    public DeltaTracker.Timer timer;
+
     @Inject(method="<init>", at=@At("RETURN"))
     public void init(GameConfig gameConfig, CallbackInfo ci) {
         ReplayUI.init();
@@ -163,13 +165,10 @@ public abstract class MixinMinecraft implements MinecraftExt {
     @WrapOperation(method = "runTick", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/sounds/SoundManager;updateSource(Lnet/minecraft/client/Camera;)V"))
     public void runTick_updateSource(SoundManager instance, Camera camera, Operation<Void> original) {
         EditorState editorState = EditorStateManager.getCurrent();
-        if (editorState != null && editorState.audioSourceEntity != null && this.level != null) {
-            Entity sourceEntity = this.level.getEntities().get(editorState.audioSourceEntity);
-            if (sourceEntity != null) {
-                Camera dummyCamera = new Camera();
-                dummyCamera.eyeHeight = sourceEntity.getEyeHeight();
-                dummyCamera.setup(this.level, sourceEntity, false, false, 1.0f);
-                instance.updateSource(dummyCamera);
+        if (editorState != null) {
+            Camera audioCamera = editorState.getAudioCamera();
+            if (audioCamera != null) {
+                original.call(instance, audioCamera);
                 return;
             }
         }
@@ -225,7 +224,7 @@ public abstract class MixinMinecraft implements MinecraftExt {
     private final DeltaTracker.Timer localPlayerTimer = new DeltaTracker.Timer(20.0f, 0, FloatUnaryOperator.identity());
 
     @Inject(method = "disconnect(Lnet/minecraft/client/gui/screens/Screen;Z)V", at = @At("HEAD"))
-    public void disconnect(Screen screen, boolean isTransferring, CallbackInfo ci) {
+    public void disconnectHead(Screen screen, boolean isTransferring, CallbackInfo ci) {
         try {
             if (Flashback.getConfig().automaticallyFinish && Flashback.RECORDER != null && !isTransferring) {
                 Flashback.finishRecordingReplay();
@@ -233,6 +232,11 @@ public abstract class MixinMinecraft implements MinecraftExt {
         } catch (Exception e) {
             Flashback.LOGGER.error("Failed to finish replay on disconnect", e);
         }
+    }
+
+    @Inject(method = "disconnect(Lnet/minecraft/client/gui/screens/Screen;Z)V", at = @At("RETURN"))
+    public void disconnectReturn(Screen screen, boolean bl, CallbackInfo ci) {
+        Flashback.updateIsInReplay();
     }
 
     @Inject(method = "runTick", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/Minecraft;runAllTasks()V", shift = At.Shift.AFTER))
@@ -317,6 +321,7 @@ public abstract class MixinMinecraft implements MinecraftExt {
                 this.progressListener.set(storingChunkProgressListener);
                 return ProcessorChunkProgressListener.createStarted(storingChunkProgressListener, this.progressTasks::add);
             }, playbackUUID, path));
+            Flashback.updateIsInReplay();
             this.isLocalServer = true;
             this.updateReportEnvironment(ReportEnvironment.local());
 //            this.quickPlayLog.setWorldData(QuickPlayLog.Type.SINGLEPLAYER, levelStorageAccess.getLevelId(), worldStem.worldData().getLevelName());

@@ -4,12 +4,18 @@ import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.mojang.authlib.GameProfile;
 import com.moulberry.flashback.Flashback;
+import com.moulberry.flashback.SneakyThrow;
 import com.moulberry.flashback.ext.LevelChunkExt;
 import com.moulberry.flashback.TempFolderProvider;
 import com.moulberry.flashback.keyframe.handler.ReplayServerKeyframeHandler;
+import com.moulberry.flashback.packet.FlashbackAccurateEntityPosition;
 import com.moulberry.flashback.packet.FlashbackClearParticles;
 import com.moulberry.flashback.packet.FlashbackForceClientTick;
 import com.moulberry.flashback.packet.FlashbackInstantlyLerp;
+import com.moulberry.flashback.packet.FlashbackRemoteExperience;
+import com.moulberry.flashback.packet.FlashbackRemoteFoodData;
+import com.moulberry.flashback.packet.FlashbackRemoteSelectHotbarSlot;
+import com.moulberry.flashback.packet.FlashbackRemoteSetSlot;
 import com.moulberry.flashback.state.EditorState;
 import com.moulberry.flashback.state.EditorStateManager;
 import com.moulberry.flashback.ext.MinecraftExt;
@@ -21,8 +27,12 @@ import com.moulberry.flashback.record.FlashbackMeta;
 import com.moulberry.flashback.record.Recorder;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.handler.codec.DecoderException;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.ints.IntIterator;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.ints.IntSet;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
@@ -39,7 +49,9 @@ import net.minecraft.network.protocol.game.*;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.Services;
 import net.minecraft.server.WorldStem;
+import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerEntity;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.TicketType;
@@ -47,10 +59,14 @@ import net.minecraft.server.level.progress.ChunkProgressListenerFactory;
 import net.minecraft.server.network.ConfigurationTask;
 import net.minecraft.server.packs.repository.PackRepository;
 import net.minecraft.server.players.PlayerList;
+import net.minecraft.util.Mth;
 import net.minecraft.world.BossEvent;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.food.FoodData;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.WorldDataConfiguration;
@@ -59,33 +75,36 @@ import net.minecraft.world.level.storage.LevelStorageSource;
 import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
 
-import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
-import java.util.zip.ZipEntry;
 
 public class ReplayServer extends IntegratedServer {
 
     private static final Gson GSON = new Gson();
     public static int REPLAY_VIEWER_IDS_START = -981723987;
     public static String REPLAY_VIEWER_NAME = "Replay Viewer";
+    public static final int CHUNK_CACHE_SIZE = 10000;
 
     public volatile int jumpToTick = -1;
     public volatile boolean replayPaused = true;
@@ -103,16 +122,18 @@ public class ReplayServer extends IntegratedServer {
     private StreamCodec<ByteBuf, Packet<? super ClientGamePacketListener>> gamePacketCodec;
     private final StreamCodec<ByteBuf, Packet<? super ClientConfigurationPacketListener>> configurationPacketCodec;
     private final List<ReplayPlayer> replayViewers = new ArrayList<>();
-    public boolean followLocalPlayerNextTick = false;
-    public boolean followLocalPlayerNextTickIfFar = false;
+    public boolean followLocalPlayerNextTickIfWrongDimension = false;
     public boolean isProcessingSnapshot = false;
     private boolean processedSnapshot = false;
-    private volatile boolean fastForwarding = false;
+    public volatile boolean fastForwarding = false;
+
+    private int printFailedDecodePacketCount = 8;
 
     private final UUID playbackUUID;
     private final FlashbackMeta metadata;
     private final TreeMap<Integer, PlayableChunk> playableChunksByStart = new TreeMap<>();
     private final Int2ObjectMap<ClientboundLevelChunkWithLightPacket> levelChunkCachedPackets = new Int2ObjectOpenHashMap<>();
+    private final IntSet loadedChunkCacheFiles = new IntOpenHashSet();
     private ReplayReader currentReplayReader = null;
 
     private record RemotePack(UUID id, String url, String hash){}
@@ -121,9 +142,11 @@ public class ReplayServer extends IntegratedServer {
     private final Map<UUID, BossEvent> bossEvents = new HashMap<>();
     private Component tabListHeader = Component.empty();
     private Component tabListFooter = Component.empty();
+    private final Map<ResourceKey<Level>, IntSet> needsPositionUpdate = new HashMap<>();
 
     private Component shutdownReason = null;
     private FileSystem playbackFileSystem = null;
+    private boolean initializedWithSnapshot = false;
 
     public ReplayServer(Thread thread, Minecraft minecraft, LevelStorageSource.LevelStorageAccess levelStorageAccess, PackRepository packRepository, WorldStem worldStem, Services services,
                         ChunkProgressListenerFactory chunkProgressListenerFactory, UUID playbackUUID, Path path) {
@@ -156,44 +179,53 @@ public class ReplayServer extends IntegratedServer {
 
             Path levelChunkCachePath = this.playbackFileSystem.getPath("/level_chunk_cache");
             if (Files.exists(levelChunkCachePath)) {
-                int chunkCacheIndex = 0;
-
-                byte[] bytes = Files.readAllBytes(levelChunkCachePath);
-                ByteBuf byteBuf = Unpooled.wrappedBuffer(bytes);
-                while (byteBuf.readerIndex() < byteBuf.writerIndex()) {
-                    int size = byteBuf.readInt();
-
-                    if (size < 0) {
-                        Flashback.LOGGER.error("Expected positive size for chunk packet, got {}", size);
-                        break;
-                    }
-
-                    if (byteBuf.readerIndex() > byteBuf.writerIndex() - size) {
-                        Flashback.LOGGER.error("Ran out of bytes while reading level_chunk_cache, needed {}, had {}",
-                                size, byteBuf.writerIndex() - byteBuf.readerIndex());
-                        break;
-                    }
-
-                    RegistryFriendlyByteBuf registryFriendlyByteBuf = new RegistryFriendlyByteBuf(byteBuf.readSlice(size), this.registryAccess());
-
-                    try {
-                        Packet<?> packet = this.gamePacketCodec.decode(registryFriendlyByteBuf);
-                        if (packet instanceof ClientboundLevelChunkWithLightPacket levelChunkWithLightPacket) {
-                            this.levelChunkCachedPackets.put(chunkCacheIndex, levelChunkWithLightPacket);
-                        } else {
-                            throw new IllegalStateException("Level chunk cache contains wrong packet: " + packet);
-                        }
-                    } catch (Exception e) {
-                        Flashback.LOGGER.error("Encountered error while reading level_chunk_cache", e);
-                    }
-
-                    chunkCacheIndex += 1;
-                }
-                Flashback.LOGGER.info("Loaded level_chunk_cache with {} entries", this.levelChunkCachedPackets.size());
+                loadLevelChunkCache(levelChunkCachePath, 0, "/level_chunk_cache");
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private void loadLevelChunkCache(Path levelChunkCachePath, int chunkCacheIndex, String name) throws IOException {
+        int startIndex = chunkCacheIndex;
+
+        try (InputStream is = Files.newInputStream(levelChunkCachePath)) {
+            while (true) {
+                byte[] sizeBuffer = is.readNBytes(4);
+                if (sizeBuffer.length < 4) {
+                    break;
+                }
+
+                int size = (sizeBuffer[0] & 0xff) << 24 |
+                    (sizeBuffer[1] & 0xff) << 16 |
+                    (sizeBuffer[2] & 0xff) <<  8 |
+                    sizeBuffer[3] & 0xff;
+
+                byte[] chunk = is.readNBytes(size);
+                if (chunk.length < size) {
+                    Flashback.LOGGER.error("Ran out of bytes while reading level_chunk_cache, needed {}, had {}",
+                        size, chunk.length);
+                    break;
+                }
+
+                RegistryFriendlyByteBuf registryFriendlyByteBuf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(chunk), this.registryAccess());
+
+                try {
+                    Packet<?> packet = this.gamePacketCodec.decode(registryFriendlyByteBuf);
+                    if (packet instanceof ClientboundLevelChunkWithLightPacket levelChunkWithLightPacket) {
+                        this.levelChunkCachedPackets.put(chunkCacheIndex, levelChunkWithLightPacket);
+                    } else {
+                        throw new IllegalStateException("Level chunk cache contains wrong packet: " + packet);
+                    }
+                } catch (Exception e) {
+                    Flashback.LOGGER.error("Encountered error while reading level_chunk_cache", e);
+                }
+
+                chunkCacheIndex += 1;
+            }
+        }
+
+        Flashback.LOGGER.info("Loaded {} with {} entries", name, chunkCacheIndex - startIndex);
     }
 
     public FlashbackMeta getMetadata() {
@@ -255,6 +287,22 @@ public class ReplayServer extends IntegratedServer {
             }
 
             @Override
+            public void sendPlayerPermissionLevel(ServerPlayer serverPlayer) {
+                if (serverPlayer instanceof FakePlayer) {
+                    return;
+                }
+                super.sendPlayerPermissionLevel(serverPlayer);
+            }
+
+            @Override
+            public void sendAllPlayerInfo(ServerPlayer serverPlayer) {
+                if (serverPlayer instanceof FakePlayer) {
+                    return;
+                }
+                super.sendAllPlayerInfo(serverPlayer);
+            }
+
+            @Override
             public void broadcast(@Nullable Player player, double x, double y, double z, double distance, ResourceKey<Level> resourceKey, Packet<?> packet) {
                 UUID audioSourceEntity = null;
 
@@ -286,6 +334,10 @@ public class ReplayServer extends IntegratedServer {
 
             @Override
             public void sendLevelInfo(ServerPlayer serverPlayer, ServerLevel serverLevel) {
+                if (serverPlayer instanceof FakePlayer) {
+                    return;
+                }
+
                 super.sendLevelInfo(serverPlayer, serverLevel);
 
                 // Send all resource packs
@@ -322,10 +374,6 @@ public class ReplayServer extends IntegratedServer {
 
         this.loadLevel();
         this.overworld().noSave = true;
-
-        // Play initial snapshot
-        ReplayReader replayReader = this.playableChunksByStart.get(0).getOrLoadReplayReader(this.registryAccess());
-        replayReader.handleSnapshot(this);
 
         return true;
     }
@@ -386,6 +434,18 @@ public class ReplayServer extends IntegratedServer {
             partial = Math.max(0, Math.min(1, partial));
 
             return this.lastReplayTick + (float) partial;
+        }
+    }
+
+    public float getPartialServerTick() {
+        if (this.replayPaused || this.isPaused()) {
+            return 1.0f;
+        } else {
+            long currentNanos = Util.getNanos();
+            long nanosPerTick = this.tickRateManager().nanosecondsPerTick();
+
+            double partial = (currentNanos - this.lastTickTimeNanos) / (double) nanosPerTick;
+            return Math.max(0, Math.min(1, (float) partial));
         }
     }
 
@@ -500,7 +560,20 @@ public class ReplayServer extends IntegratedServer {
     public void handleGamePacket(RegistryFriendlyByteBuf friendlyByteBuf) {
         this.configurationPacketHandler.flushPendingConfiguration();
 
-        Packet<? super ClientGamePacketListener> packet = this.gamePacketCodec.decode(friendlyByteBuf);
+        Packet<? super ClientGamePacketListener> packet;
+        try {
+            packet = this.gamePacketCodec.decode(friendlyByteBuf);
+        } catch (DecoderException decoderException) {
+            // Failed to decode packet, lets try ignoring it
+            if (printFailedDecodePacketCount > 0) {
+                Flashback.LOGGER.error("Failed to decode packet from replay stream", decoderException);
+                printFailedDecodePacketCount -= 1;
+            }
+
+            this.gamePacketHandler.flushPendingEntities();
+            friendlyByteBuf.readerIndex(friendlyByteBuf.writerIndex());
+            return;
+        }
         if (!AllowPendingEntityPacketSet.allowPendingEntity(packet)) {
             this.gamePacketHandler.flushPendingEntities();
         }
@@ -513,6 +586,14 @@ public class ReplayServer extends IntegratedServer {
         this.gamePacketHandler.handleCreateLocalPlayer(friendlyByteBuf);
     }
 
+    public void handleAccuratePlayerPosition(RegistryFriendlyByteBuf friendlyByteBuf) {
+        var packet = FlashbackAccurateEntityPosition.STREAM_CODEC.decode(friendlyByteBuf);
+
+        for (ReplayPlayer replayViewer : this.replayViewers) {
+            ServerPlayNetworking.send(replayViewer, packet);
+        }
+    }
+
     public void handleMoveEntities(RegistryFriendlyByteBuf friendlyByteBuf) {
         this.gamePacketHandler.flushPendingEntities();
         this.configurationPacketHandler.flushPendingConfiguration();
@@ -521,6 +602,11 @@ public class ReplayServer extends IntegratedServer {
         for (int i = 0; i < levelCount; i++) {
             ResourceKey<Level> dimension = friendlyByteBuf.readResourceKey(Registries.DIMENSION);
             ServerLevel level = this.levels.get(dimension);
+
+            IntSet positionUpdateSet = null;
+            if (level != null) {
+                positionUpdateSet = this.needsPositionUpdate.computeIfAbsent(dimension, k -> new IntOpenHashSet());
+            }
 
             int count = friendlyByteBuf.readVarInt();
             for (int j = 0; j < count; j++) {
@@ -541,6 +627,8 @@ public class ReplayServer extends IntegratedServer {
                         if (entity.onGround() != onGround) {
                             entity.setOnGround(onGround);
                         }
+
+                        positionUpdateSet.add(id);
                     }
                 }
             }
@@ -549,6 +637,22 @@ public class ReplayServer extends IntegratedServer {
 
     public void handleLevelChunkCached(int index) {
         ClientboundLevelChunkWithLightPacket packet = this.levelChunkCachedPackets.get(index);
+        if (packet == null) {
+            int cacheIndex = index / ReplayServer.CHUNK_CACHE_SIZE;
+            if (this.loadedChunkCacheFiles.add(cacheIndex)) {
+                String pathString = "/level_chunk_caches/" + cacheIndex;
+                Path levelChunkCachePath = this.playbackFileSystem.getPath(pathString);
+                if (Files.exists(levelChunkCachePath)) {
+                    try {
+                        loadLevelChunkCache(levelChunkCachePath, cacheIndex * ReplayServer.CHUNK_CACHE_SIZE, pathString);
+                    } catch (IOException e) {
+                        SneakyThrow.sneakyThrow(e);
+                    }
+                }
+                packet = this.levelChunkCachedPackets.get(index);
+            }
+        }
+
         if (packet != null) {
             this.configurationPacketHandler.flushPendingConfiguration();
             this.gamePacketHandler.flushPendingEntities();
@@ -589,7 +693,8 @@ public class ReplayServer extends IntegratedServer {
 
     public void clearLevel(ServerLevel serverLevel) {
         for (ServerPlayer player : new ArrayList<>(serverLevel.players())) {
-            if (player instanceof ReplayPlayer) {
+            if (player instanceof ReplayPlayer replayPlayer) {
+                replayPlayer.lastFirstPersonDataUUID = null;
                 continue;
             }
             player.connection.disconnect(Component.empty());
@@ -623,15 +728,38 @@ public class ReplayServer extends IntegratedServer {
 
     @Override
     public void tickServer(BooleanSupplier booleanSupplier) {
+        if (!this.initializedWithSnapshot) {
+            this.initializedWithSnapshot = true;
+
+            // Play initial snapshot
+            ReplayReader replayReader = this.playableChunksByStart.get(0).getOrLoadReplayReader(this.registryAccess());
+            replayReader.handleSnapshot(this);
+        }
+
+//        this.accurateEntityPositions = this.pendingAccurateEntityPositions;
+//        this.pendingAccurateEntityPositions = new ConcurrentHashMap<>();
         this.lastReplayTick = this.currentTick;
         this.lastTickTimeNanos = this.nextTickTimeNanos - this.tickRateManager().nanosecondsPerTick();
 
         // Update list of replay viewers
         this.replayViewers.clear();
+
         for (ServerPlayer player : this.getPlayerList().getPlayers()) {
             if (player instanceof ReplayPlayer replayPlayer) {
-                Entity cameraEntity = replayPlayer.getCamera();
-                replayPlayer.spectatingUuid = cameraEntity == null || cameraEntity == replayPlayer ? null : cameraEntity.getUUID();
+                if (replayPlayer.isShiftKeyDown()) {
+                    replayPlayer.spectatingUuid = null;
+                    replayPlayer.spectatingUuidTickCount = 0;
+                } else {
+                    Entity cameraEntity = replayPlayer.getCamera();
+                    if (cameraEntity != null && cameraEntity != replayPlayer) {
+                        replayPlayer.spectatingUuid = cameraEntity.getUUID();
+                        replayPlayer.spectatingUuidTickCount = 20;
+                    } else if (replayPlayer.spectatingUuidTickCount > 0) {
+                        replayPlayer.spectatingUuidTickCount -= 1;
+                    } else {
+                        replayPlayer.spectatingUuid = null;
+                    }
+                }
                 this.replayViewers.add(replayPlayer);
             }
         }
@@ -650,8 +778,10 @@ public class ReplayServer extends IntegratedServer {
             this.replayPaused = true;
         }
 
+        boolean forceApplyKeyframes = this.forceApplyKeyframes.compareAndSet(true, false) && Flashback.EXPORT_JOB == null;
+
         if (Flashback.EXPORT_JOB != null || this.targetTick == this.currentTick || normalPlayback) {
-            this.runUpdates(booleanSupplier);
+            this.runUpdates(booleanSupplier, forceApplyKeyframes);
         } else {
             int realTargetTick = this.targetTick;
 
@@ -664,12 +794,12 @@ public class ReplayServer extends IntegratedServer {
 
             if (this.targetTick >= realTargetTick) {
                 this.targetTick = realTargetTick;
-                this.runUpdates(booleanSupplier);
+                this.runUpdates(booleanSupplier, forceApplyKeyframes);
             } else {
                 while (this.targetTick <= realTargetTick) {
                     this.fastForwarding = this.targetTick < realTargetTick;
 
-                    this.runUpdates(booleanSupplier);
+                    this.runUpdates(booleanSupplier, forceApplyKeyframes);
 
                     if (this.targetTick == realTargetTick) {
                         break;
@@ -681,7 +811,85 @@ public class ReplayServer extends IntegratedServer {
             }
         }
 
+        if (forceApplyKeyframes) {
+            ((MinecraftExt)Minecraft.getInstance()).flashback$applyKeyframes();
+        }
+
         this.tryFollowLocalPlayer();
+
+        // Update first person data
+        for (ReplayPlayer replayViewer : this.replayViewers) {
+            // Ensure replay viewers are still spectating
+            if (replayViewer.spectatingUuid != null) {
+                Entity camera = replayViewer.getCamera();
+                if (camera == null || camera == replayViewer || camera.isRemoved()) {
+                    Entity targetEntity = replayViewer.serverLevel().getEntity(replayViewer.spectatingUuid);
+                    if (targetEntity != null && !targetEntity.isRemoved()) {
+                        replayViewer.setCamera(targetEntity);
+                    }
+                }
+            }
+
+            Entity camera = replayViewer.getCamera();
+            if (camera != replayViewer && camera instanceof Player playerCamera) {
+                Inventory inventory = playerCamera.getInventory();
+                if (!Objects.equals(replayViewer.lastFirstPersonDataUUID, playerCamera.getUUID())) {
+                    replayViewer.lastFirstPersonDataUUID = playerCamera.getUUID();
+
+                    replayViewer.lastFirstPersonExperienceProgress = playerCamera.experienceProgress;
+                    replayViewer.lastFirstPersonTotalExperience = playerCamera.totalExperience;
+                    replayViewer.lastFirstPersonExperienceLevel = playerCamera.experienceLevel;
+                    ServerPlayNetworking.send(replayViewer, new FlashbackRemoteExperience(playerCamera.getId(), playerCamera.experienceProgress,
+                        playerCamera.totalExperience, playerCamera.experienceLevel));
+
+                    FoodData foodData = playerCamera.getFoodData();
+                    replayViewer.lastFirstPersonFoodLevel = foodData.getFoodLevel();
+                    replayViewer.lastFirstPersonSaturationLevel = foodData.getSaturationLevel();
+                    ServerPlayNetworking.send(replayViewer, new FlashbackRemoteFoodData(playerCamera.getId(), foodData.getFoodLevel(), foodData.getSaturationLevel()));
+
+                    replayViewer.lastFirstPersonSelectedSlot = inventory.selected;
+                    ServerPlayNetworking.send(replayViewer, new FlashbackRemoteSelectHotbarSlot(playerCamera.getId(), inventory.selected));
+
+                    for (int i = 0; i < 9; i++) {
+                        ItemStack hotbarItem = inventory.getItem(i);
+                        replayViewer.lastFirstPersonHotbarItems[i] = hotbarItem.copy();
+                        ServerPlayNetworking.send(replayViewer, new FlashbackRemoteSetSlot(playerCamera.getId(), i, hotbarItem.copy()));
+                    }
+                } else {
+                    if (replayViewer.lastFirstPersonExperienceProgress != playerCamera.experienceProgress ||
+                            replayViewer.lastFirstPersonTotalExperience != playerCamera.totalExperience ||
+                            replayViewer.lastFirstPersonExperienceLevel != playerCamera.experienceLevel) {
+                        replayViewer.lastFirstPersonExperienceProgress = playerCamera.experienceProgress;
+                        replayViewer.lastFirstPersonTotalExperience = playerCamera.totalExperience;
+                        replayViewer.lastFirstPersonExperienceLevel = playerCamera.experienceLevel;
+                        ServerPlayNetworking.send(replayViewer, new FlashbackRemoteExperience(playerCamera.getId(), playerCamera.experienceProgress,
+                            playerCamera.totalExperience, playerCamera.experienceLevel));
+                    }
+
+                    FoodData foodData = playerCamera.getFoodData();
+                    if (replayViewer.lastFirstPersonFoodLevel != foodData.getFoodLevel() || replayViewer.lastFirstPersonSaturationLevel != foodData.getSaturationLevel()) {
+                        replayViewer.lastFirstPersonFoodLevel = foodData.getFoodLevel();
+                        replayViewer.lastFirstPersonSaturationLevel = foodData.getSaturationLevel();
+                        ServerPlayNetworking.send(replayViewer, new FlashbackRemoteFoodData(playerCamera.getId(), foodData.getFoodLevel(), foodData.getSaturationLevel()));
+                    }
+
+                    if (replayViewer.lastFirstPersonSelectedSlot != inventory.selected) {
+                        replayViewer.lastFirstPersonSelectedSlot = inventory.selected;
+                        ServerPlayNetworking.send(replayViewer, new FlashbackRemoteSelectHotbarSlot(playerCamera.getId(), inventory.selected));
+                    }
+
+                    for (int i = 0; i < 9; i++) {
+                        ItemStack hotbarItem = inventory.getItem(i);
+                        if (!ItemStack.matches(replayViewer.lastFirstPersonHotbarItems[i], hotbarItem)) {
+                            replayViewer.lastFirstPersonHotbarItems[i] = hotbarItem.copy();
+                            ServerPlayNetworking.send(replayViewer, new FlashbackRemoteSetSlot(playerCamera.getId(), i, hotbarItem.copy()));
+                        }
+                    }
+                }
+            } else {
+                replayViewer.lastFirstPersonDataUUID = null;
+            }
+        }
 
         // Update resourcepacks
         if (this.remotePacks.isEmpty()) {
@@ -723,15 +931,10 @@ public class ReplayServer extends IntegratedServer {
         }
     }
 
-    private void runUpdates(BooleanSupplier booleanSupplier) {
-        boolean forceApplyKeyframes = this.forceApplyKeyframes.compareAndSet(true, false) && Flashback.EXPORT_JOB == null;
+    private void runUpdates(BooleanSupplier booleanSupplier, boolean forceApplyKeyframes) {
         if (!this.replayPaused || forceApplyKeyframes) {
             this.desiredTickRate = 20.0f;
             this.getEditorState().applyKeyframes(new ReplayServerKeyframeHandler(this), this.targetTick);
-
-            if (forceApplyKeyframes) {
-                ((MinecraftExt)Minecraft.getInstance()).flashback$applyKeyframes();
-            }
         }
 
         float tickRate = this.desiredTickRate;
@@ -759,6 +962,48 @@ public class ReplayServer extends IntegratedServer {
         // Tick underlying server
         super.tickServer(booleanSupplier);
 
+        // Teleport entities
+        if (!this.needsPositionUpdate.isEmpty()) {
+            for (Map.Entry<ResourceKey<Level>, IntSet> entry : this.needsPositionUpdate.entrySet()) {
+                ResourceKey<Level> dimension = entry.getKey();
+                IntSet entities = entry.getValue();
+
+                ServerLevel level = this.getLevel(dimension);
+                if (level != null) {
+                    Int2ObjectMap<ChunkMap.TrackedEntity> entityMap = level.getChunkSource().chunkMap.entityMap;
+
+                    IntIterator iterator = entities.intIterator();
+                    while (iterator.hasNext()) {
+                        int entityId = iterator.nextInt();
+
+                        ChunkMap.TrackedEntity trackedEntity = entityMap.get(entityId);
+                        if (trackedEntity == null) {
+                            continue;
+                        }
+
+                        ServerEntity serverEntity = trackedEntity.serverEntity;
+
+                        Vec3 trackingPosition = serverEntity.entity.trackingPosition();
+
+                        int quantizedYRot = Mth.floor(serverEntity.entity.getYRot() * 256.0F / 360.0F);
+                        int quantizedXRot = Mth.floor(serverEntity.entity.getXRot() * 256.0F / 360.0F);
+
+                        if (!serverEntity.positionCodec.getBase().equals(trackingPosition)) {
+                            trackedEntity.broadcast(new ClientboundTeleportEntityPacket(serverEntity.entity));
+                            serverEntity.positionCodec.setBase(trackingPosition);
+                            serverEntity.lastSentYRot = quantizedYRot;
+                            serverEntity.lastSentXRot = quantizedXRot;
+                        } else if (quantizedYRot != serverEntity.lastSentYRot || quantizedXRot != serverEntity.lastSentXRot) {
+                            trackedEntity.broadcast(new ClientboundMoveEntityPacket.Rot(entityId, (byte) quantizedYRot, (byte) quantizedXRot, serverEntity.wasOnGround));
+                            serverEntity.lastSentYRot = quantizedYRot;
+                            serverEntity.lastSentXRot = quantizedXRot;
+                        }
+                    }
+                }
+            }
+            this.needsPositionUpdate.clear();
+        }
+
         if (Flashback.EXPORT_JOB == null) {
             if (this.processedSnapshot) {
                 this.processedSnapshot = false;
@@ -767,21 +1012,6 @@ public class ReplayServer extends IntegratedServer {
                     replayViewer.connection.chunkSender.sendNextChunks(replayViewer);
                     ServerPlayNetworking.send(replayViewer, FlashbackInstantlyLerp.INSTANCE);
                     ServerPlayNetworking.send(replayViewer, FlashbackClearParticles.INSTANCE);
-
-                    // Ensure replay viewers are still spectating
-                    if (replayViewer.spectatingUuid != null) {
-                        Entity camera = replayViewer.getCamera();
-                        if (camera == null || camera == replayViewer || camera.isRemoved()) {
-                            Entity targetEntity = replayViewer.serverLevel().getEntity(replayViewer.spectatingUuid);
-                            if (targetEntity != null && !targetEntity.isRemoved()) {
-                                replayViewer.setCamera(targetEntity);
-                            } else {
-                                replayViewer.spectatingUuid = null;
-                            }
-                        } else {
-                            replayViewer.spectatingUuid = null;
-                        }
-                    }
                 }
                 for (ServerLevel level : this.getAllLevels()) {
                     for (ServerPlayer player : level.players()) {
@@ -921,9 +1151,9 @@ public class ReplayServer extends IntegratedServer {
         }
 
         for (ReplayPlayer replayViewer : this.getReplayViewers()) {
-            boolean shouldFollow = replayViewer.followLocalPlayerNextTick || this.followLocalPlayerNextTick;
-            if (this.followLocalPlayerNextTickIfFar) {
-                shouldFollow |= replayViewer.level() != currentLevel || replayViewer.distanceToSqr(follow) > 256*256;
+            boolean shouldFollow = replayViewer.followLocalPlayerNextTick;
+            if (this.followLocalPlayerNextTickIfWrongDimension) {
+                shouldFollow |= replayViewer.level() != currentLevel;
             }
             if (shouldFollow) {
                 replayViewer.followLocalPlayerNextTick = false;
@@ -932,8 +1162,7 @@ public class ReplayServer extends IntegratedServer {
             }
         }
 
-        this.followLocalPlayerNextTick = false;
-        this.followLocalPlayerNextTickIfFar = false;
+        this.followLocalPlayerNextTickIfWrongDimension = false;
     }
 
     private void stopWithReason(Component reason) {
@@ -968,7 +1197,7 @@ public class ReplayServer extends IntegratedServer {
 
         // Stop server
         super.stopServer();
-        this.clearReplayTempFolder();
+        TempFolderProvider.deleteTemp(TempFolderProvider.TempFolderType.SERVER, this.playbackUUID);
 
         if (this.playbackFileSystem != null) {
             try {
@@ -977,10 +1206,28 @@ public class ReplayServer extends IntegratedServer {
                 Flashback.LOGGER.error("Failed to close playback zip", e);
             }
         }
+
+        this.levelChunkCachedPackets.clear();
+        this.playableChunksByStart.clear();
     }
 
     public void clearReplayTempFolder() {
-        TempFolderProvider.deleteTemp(TempFolderProvider.TempFolderType.SERVER, this.playbackUUID);
+        Path temp = TempFolderProvider.createTemp(TempFolderProvider.TempFolderType.SERVER, this.playbackUUID);
+
+        // Delete all files, but not directories
+        try {
+            Files.walkFileTree(temp, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    if (!Files.isDirectory(file)) {
+                        Files.deleteIfExists(file);
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            Flashback.LOGGER.error("Unable to delete replay temp folder", e);
+        }
     }
 
     @Override

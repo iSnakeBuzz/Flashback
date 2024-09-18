@@ -3,35 +3,39 @@ package com.moulberry.flashback.exporting;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.pipeline.TextureTarget;
 import com.mojang.blaze3d.platform.GlStateManager;
-import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.platform.Window;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.*;
 import com.moulberry.flashback.FixedDeltaTracker;
 import com.moulberry.flashback.Flashback;
+import com.moulberry.flashback.SneakyThrow;
 import com.moulberry.flashback.Utils;
-import com.moulberry.flashback.compat.IrisApiWrapper;
+import com.moulberry.flashback.combo_options.VideoContainer;
+import com.moulberry.flashback.editor.ui.ReplayUI;
 import com.moulberry.flashback.keyframe.KeyframeType;
 import com.moulberry.flashback.keyframe.handler.KeyframeHandler;
 import com.moulberry.flashback.keyframe.handler.MinecraftKeyframeHandler;
+import com.moulberry.flashback.keyframe.types.SpeedKeyframeType;
+import com.moulberry.flashback.keyframe.types.TimelapseKeyframeType;
 import com.moulberry.flashback.state.EditorState;
-import com.moulberry.flashback.state.EditorStateManager;
 import com.moulberry.flashback.playback.ReplayServer;
-import com.moulberry.flashback.state.KeyframeTrack;
+import com.moulberry.flashback.visuals.AccurateEntityPositionHandler;
 import it.unimi.dsi.fastutil.doubles.DoubleArrayList;
 import it.unimi.dsi.fastutil.doubles.DoubleList;
-import it.unimi.dsi.fastutil.floats.FloatArrayList;
-import it.unimi.dsi.fastutil.floats.FloatList;
+import net.minecraft.ChatFormatting;
+import net.minecraft.Util;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.Screenshot;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.renderer.FogRenderer;
 import net.minecraft.client.renderer.ShaderInstance;
+import net.minecraft.network.chat.Component;
+import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.phys.Vec3;
+import org.bytedeco.ffmpeg.global.avutil;
 import org.joml.Matrix4f;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.openal.SOFTLoopback;
@@ -44,10 +48,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
@@ -71,10 +75,15 @@ public class ExportJob {
     private long renderTimeNanos = 0;
     private long encodeTimeNanos = 0;
     private long downloadTimeNanos = 0;
+    private boolean patreonLinkClicked = false;
+
+    private double currentTickDouble = 0.0;
 
     private double audioSamples = 0.0;
 
     private final AtomicBoolean finishedServerTick = new AtomicBoolean(false);
+
+    public static final int SRC_PIXEL_FORMAT = avutil.AV_PIX_FMT_RGBA;
 
     public ExportJob(ExportSettings settings) {
         this.settings = settings;
@@ -94,11 +103,15 @@ public class ExportJob {
     }
 
     public int getWidth() {
-        return this.settings.resolutionX();
+        return this.settings.resolutionX() * (this.settings.ssaa() ? 2 : 1);
     }
 
     public int getHeight() {
-        return this.settings.resolutionY();
+        return this.settings.resolutionY() * (this.settings.ssaa() ? 2 : 1);
+    }
+
+    public double getCurrentTickDouble() {
+        return this.currentTickDouble;
     }
 
     public Random getParticleRandom() {
@@ -125,24 +138,29 @@ public class ExportJob {
 
         TextureTarget infoRenderTarget = null;
 
+        int oldGuiScale = Minecraft.getInstance().options.guiScale().get();
+
         try {
             Files.createDirectories(exportTempFolder);
 
             RenderTarget mainTarget = Minecraft.getInstance().mainRenderTarget;
             infoRenderTarget = new TextureTarget(mainTarget.width, mainTarget.height, false, Minecraft.ON_OSX);
 
-            try (AsyncVideoEncoder encoder = new AsyncVideoEncoder(this.settings, tempFileName);
-                    SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY())) {
+            try (VideoWriter encoder = createVideoWriter(this.settings, tempFileName);
+                 SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY())) {
                 doExport(encoder, downloader, infoRenderTarget);
             }
 
-            Files.move(exportTempFile, this.settings.output(), StandardCopyOption.REPLACE_EXISTING);
+            if (this.settings.container() != VideoContainer.PNG_SEQUENCE) {
+                Files.move(exportTempFile, this.settings.output(), StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (IOException e) {
             throw new RuntimeException(e);
         } finally {
             this.running = false;
             this.shouldChangeFramebufferSize = false;
 
+            Minecraft.getInstance().options.guiScale().set(oldGuiScale);
             Minecraft.getInstance().resizeDisplay();
 
             try {
@@ -165,7 +183,15 @@ public class ExportJob {
         }
     }
 
-    private void doExport(AsyncVideoEncoder encoder, SaveableFramebufferQueue downloader, TextureTarget infoRenderTarget) {
+    private static VideoWriter createVideoWriter(ExportSettings settings, String tempFileName) {
+        if (settings.container() == VideoContainer.PNG_SEQUENCE) {
+            return new PNGSequenceVideoWriter(settings);
+        } else {
+            return new AsyncFFmpegVideoWriter(settings, tempFileName);
+        }
+    }
+
+    private void doExport(VideoWriter videoWriter, SaveableFramebufferQueue downloader, TextureTarget infoRenderTarget) {
         ReplayServer replayServer = Flashback.getReplayServer();
         if (replayServer == null) {
             return;
@@ -178,7 +204,12 @@ public class ExportJob {
         this.updateRandoms(random, mathRandom);
 
         shouldChangeFramebufferSize = true;
+        // Double gui scale if using SSAA which doubles resolution
+        if (this.settings.ssaa()) {
+            Minecraft.getInstance().options.guiScale().set(Minecraft.getInstance().options.guiScale().get() * 2);
+        }
         Minecraft.getInstance().resizeDisplay();
+
 
         DoubleList ticks = calculateTicks(this.settings.editorState(), this.settings.startTick(), this.settings.endTick(), this.settings.framerate());
 
@@ -189,7 +220,7 @@ public class ExportJob {
         double lastTickDouble = 0;
 
         for (int tickIndex = 0; tickIndex < ticks.size(); tickIndex++) {
-            double currentTickDouble = ticks.getDouble(tickIndex);
+            this.currentTickDouble = ticks.getDouble(tickIndex);
             float deltaTicksFloat = (float)(currentTickDouble - lastTickDouble);
             lastTickDouble = currentTickDouble;
             int currentTick = (int) currentTickDouble;
@@ -247,21 +278,8 @@ public class ExportJob {
             KeyframeHandler keyframeHandler = new MinecraftKeyframeHandler(Minecraft.getInstance());
             this.settings.editorState().applyKeyframes(keyframeHandler, (float)(this.settings.startTick() + currentTickDouble));
 
-            boolean asyncFrameCapture = !IrisApiWrapper.isIrisAvailable() || !IrisApiWrapper.isShaderPackInUse();
-
-            RenderTarget oldTarget = null;
-            SaveableFramebuffer saveable = null;
-            RenderTarget renderTarget;
-
-            if (asyncFrameCapture) {
-                oldTarget = Minecraft.getInstance().getMainRenderTarget();
-                saveable = downloader.take();
-                renderTarget = saveable.getFramebuffer(this.settings.resolutionX(), this.settings.resolutionY());
-
-                Minecraft.getInstance().mainRenderTarget = renderTarget;
-            } else {
-                renderTarget = Minecraft.getInstance().mainRenderTarget;
-            }
+            SaveableFramebuffer saveable = downloader.take();
+            RenderTarget renderTarget = Minecraft.getInstance().mainRenderTarget;
 
             renderTarget.bindWrite(true);
             RenderSystem.clear(16640, Minecraft.ON_OSX);
@@ -288,38 +306,24 @@ public class ExportJob {
             if (this.settings.recordAudio()) {
                 long device = Minecraft.getInstance().getSoundManager().soundEngine.library.currentDevice;
 
-                audioSamples += 44100 / this.settings.framerate();
+                audioSamples += 48000 / this.settings.framerate();
                 int renderSamples = (int) audioSamples;
                 audioSamples -= renderSamples;
 
-                audioBuffer = ByteBuffer.allocateDirect(renderSamples * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+                int channels = this.settings.stereoAudio() ? 2 : 1;
+
+                audioBuffer = ByteBuffer.allocateDirect(renderSamples * 4 * channels).order(ByteOrder.nativeOrder()).asFloatBuffer();
                 SOFTLoopback.alcRenderSamplesSOFT(device, audioBuffer, renderSamples);
             }
 
-            if (asyncFrameCapture) {
-                Minecraft.getInstance().mainRenderTarget = oldTarget;
+            this.shouldChangeFramebufferSize = false;
+            cancel = finishFrame(renderTarget, infoRenderTarget, tickIndex, ticks.size());
+            this.shouldChangeFramebufferSize = true;
 
-                this.shouldChangeFramebufferSize = false;
-                cancel = finishFrame(renderTarget, infoRenderTarget, tickIndex, ticks.size());
-                this.shouldChangeFramebufferSize = true;
+            submitDownloadedFrames(videoWriter, downloader, false);
 
-                submitDownloadedFrames(encoder, downloader, false);
-
-                saveable.audioBuffer = audioBuffer;
-                downloader.startDownload(saveable);
-            } else {
-                this.shouldChangeFramebufferSize = false;
-                cancel = finishFrame(renderTarget, infoRenderTarget, tickIndex, ticks.size());
-                this.shouldChangeFramebufferSize = true;
-
-                start = System.nanoTime();
-                NativeImage image = Screenshot.takeScreenshot(renderTarget);
-                downloadTimeNanos += System.nanoTime() - start;
-
-                start = System.nanoTime();
-                encoder.encode(image, audioBuffer);
-                encodeTimeNanos += System.nanoTime() - start;
-            }
+            saveable.audioBuffer = audioBuffer;
+            downloader.startDownload(renderTarget, saveable, this.settings.ssaa());
 
             if (cancel) {
                 ExportJobQueue.drainingQueue = false;
@@ -327,8 +331,8 @@ public class ExportJob {
             }
         }
 
-        submitDownloadedFrames(encoder, downloader, true);
-        encoder.finish();
+        submitDownloadedFrames(videoWriter, downloader, true);
+        videoWriter.finish();
     }
 
     private void updateRandoms(Random random, Random mathRandom) {
@@ -428,14 +432,11 @@ public class ExportJob {
     }
 
     private void updateSoundSound(Minecraft minecraft) {
-        EditorState editorState = EditorStateManager.getCurrent();
-        if (editorState != null && editorState.audioSourceEntity != null && minecraft.level != null) {
-            Entity sourceEntity = minecraft.level.getEntities().get(editorState.audioSourceEntity);
-            if (sourceEntity != null) {
-                Camera dummyCamera = new Camera();
-                dummyCamera.eyeHeight = sourceEntity.getEyeHeight();
-                dummyCamera.setup(minecraft.level, sourceEntity, false, false, 1.0f);
-                minecraft.getSoundManager().updateSource(dummyCamera);
+        EditorState editorState = this.settings.editorState();
+        if (editorState != null) {
+            Camera audioCamera = editorState.getAudioCamera();
+            if (audioCamera != null) {
+                minecraft.getSoundManager().updateSource(audioCamera);
                 return;
             }
         }
@@ -450,7 +451,7 @@ public class ExportJob {
         }
     }
 
-    private void submitDownloadedFrames(AsyncVideoEncoder encoder, SaveableFramebufferQueue downloader, boolean drain) {
+    private void submitDownloadedFrames(VideoWriter videoWriter, SaveableFramebufferQueue downloader, boolean drain) {
         SaveableFramebufferQueue.DownloadedFrame frame;
         while (true) {
             long start = System.nanoTime();
@@ -462,7 +463,7 @@ public class ExportJob {
             }
 
             start = System.nanoTime();
-            encoder.encode(frame.image(), frame.audioBuffer());
+            videoWriter.encode(frame.image(), frame.audioBuffer());
             encodeTimeNanos += System.nanoTime() - start;
         }
     }
@@ -534,6 +535,8 @@ public class ExportJob {
             if (currentFrame >= this.settings.framerate()) {
                 long estimatedRemaining = (currentTime - this.renderStartTime) * (totalFrames - currentFrame) / currentFrame;
                 lines.add("Estimated time remaining: " + formatTime(estimatedRemaining));
+            } else {
+                lines.add("Estimated time remaining: ~");
             }
 
             lines.add("");
@@ -587,6 +590,31 @@ public class ExportJob {
                 }
             }
 
+            double mouseX = ReplayUI.imguiGlfw.rawMouseX / window.getWidth() * scaledWidth;
+            double mouseY = ReplayUI.imguiGlfw.rawMouseY / window.getHeight() * scaledHeight;
+
+            y += font.lineHeight / 2 + 1;
+
+            String patreon = "https://www.patreon.com/flashbackmod";
+            int patreonWidth = font.width(patreon);
+            if (mouseX > x - patreonWidth/2f && mouseX < x + patreonWidth/2f && mouseY > y && mouseY < y + font.lineHeight) {
+                font.drawInBatch(Component.literal(patreon).withStyle(ChatFormatting.UNDERLINE), x - patreonWidth/2f, y,
+                    -1, true, matrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
+
+                if (GLFW.glfwGetMouseButton(window.getWindow(), GLFW.GLFW_MOUSE_BUTTON_LEFT) != 0) {
+                    if (!this.patreonLinkClicked) {
+                        this.patreonLinkClicked = true;
+                        Util.getPlatform().openUri(patreon);
+                    }
+                } else {
+                    this.patreonLinkClicked = false;
+                }
+            } else {
+                font.drawInBatch(patreon, x - patreonWidth/2f, y,
+                    -1, true, matrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
+                this.patreonLinkClicked = false;
+            }
+
             bufferSource.endBatch();
             RenderSystem.enableDepthTest();
 
@@ -619,8 +647,8 @@ public class ExportJob {
         private float tickrate = 20.0f;
 
         @Override
-        public EnumSet<KeyframeType> supportedKeyframes() {
-            return EnumSet.of(KeyframeType.SPEED, KeyframeType.TIMELAPSE);
+        public Set<KeyframeType<?>> supportedKeyframes() {
+            return Set.of(SpeedKeyframeType.INSTANCE, TimelapseKeyframeType.INSTANCE);
         }
 
         @Override

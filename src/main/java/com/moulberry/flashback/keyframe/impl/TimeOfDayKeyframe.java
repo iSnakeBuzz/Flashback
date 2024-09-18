@@ -2,9 +2,12 @@ package com.moulberry.flashback.keyframe.impl;
 
 import com.google.gson.*;
 import com.moulberry.flashback.Interpolation;
+import com.moulberry.flashback.editor.ui.ImGuiHelper;
 import com.moulberry.flashback.keyframe.Keyframe;
+import com.moulberry.flashback.keyframe.KeyframeType;
 import com.moulberry.flashback.keyframe.handler.KeyframeHandler;
 import com.moulberry.flashback.keyframe.interpolation.InterpolationType;
+import com.moulberry.flashback.keyframe.types.TimeOfDayKeyframeType;
 import com.moulberry.flashback.spline.CatmullRom;
 import imgui.ImGui;
 import imgui.type.ImInt;
@@ -26,6 +29,11 @@ public class TimeOfDayKeyframe extends Keyframe {
     }
 
     @Override
+    public KeyframeType<?> keyframeType() {
+        return TimeOfDayKeyframeType.INSTANCE;
+    }
+
+    @Override
     public Keyframe copy() {
         return new TimeOfDayKeyframe(this.time, this.interpolationType());
     }
@@ -33,10 +41,10 @@ public class TimeOfDayKeyframe extends Keyframe {
     @Override
     public void renderEditKeyframe(Consumer<Consumer<Keyframe>> update) {
         ImGui.setNextItemWidth(160);
-        ImInt input = new ImInt(this.time);
-        if (ImGui.inputInt("Time", input, 0)) {
-            if (this.time != input.get()) {
-                update.accept(keyframe -> ((TimeOfDayKeyframe)keyframe).time = input.get());
+        int[] input = new int[]{this.time};
+        if (ImGuiHelper.inputInt("Time", input)) {
+            if (this.time != input[0]) {
+                update.accept(keyframe -> ((TimeOfDayKeyframe)keyframe).time = input[0]);
             }
         }
     }

@@ -11,17 +11,22 @@ public class ReplayVisuals {
     public boolean showTitleText = false;
     public boolean showScoreboard = false;
     public boolean showActionBar = false;
+    public boolean showHotbar = true;
 
     public boolean renderBlocks = true;
     public boolean renderEntities = true;
     public boolean renderPlayers = true;
     public boolean renderParticles = true;
     public boolean renderSky = true;
+    public float[] skyColour = new float[]{0f, 1f, 0f};
     public boolean renderNametags = true;
 
     public boolean overrideFog = false;
     public float overrideFogStart = 0.0f;
     public float overrideFogEnd = 256.0f;
+
+    public boolean overrideFogColour = false;
+    public float[] fogColour = new float[]{0f, 1f, 0f};
 
     public boolean overrideFov = false;
     public float overrideFovAmount = 70f;

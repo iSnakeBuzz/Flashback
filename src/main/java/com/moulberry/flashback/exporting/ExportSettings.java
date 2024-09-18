@@ -1,5 +1,6 @@
 package com.moulberry.flashback.exporting;
 
+import com.moulberry.flashback.combo_options.AudioCodec;
 import com.moulberry.flashback.combo_options.VideoCodec;
 import com.moulberry.flashback.combo_options.VideoContainer;
 import com.moulberry.flashback.state.EditorState;
@@ -16,9 +17,9 @@ public record ExportSettings(@Nullable String name, EditorState editorState,
                              int resolutionX, int resolutionY, int startTick, int endTick, double framerate,
                              boolean resetRng,
                              // Video
-                             VideoContainer container, VideoCodec codec, String encoder, int bitrate,
+                             VideoContainer container, VideoCodec codec, String encoder, int bitrate, boolean transparent, boolean ssaa, boolean noGui,
                              // Audio
-                             boolean recordAudio,
+                             boolean recordAudio, boolean stereoAudio, AudioCodec audioCodec,
                              // Output
                              Path output) {
 

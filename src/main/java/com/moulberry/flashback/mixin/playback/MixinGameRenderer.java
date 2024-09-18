@@ -2,6 +2,7 @@ package com.moulberry.flashback.mixin.playback;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.moulberry.flashback.Flashback;
 import com.moulberry.flashback.state.EditorState;
@@ -9,8 +10,11 @@ import com.moulberry.flashback.state.EditorStateManager;
 import com.moulberry.flashback.editor.ui.ReplayUI;
 import com.moulberry.flashback.ext.ItemInHandRendererExt;
 import com.moulberry.flashback.ext.MinecraftExt;
+import com.moulberry.flashback.visuals.AccurateEntityPositionHandler;
 import com.moulberry.flashback.visuals.CameraRotation;
+import com.moulberry.flashback.visuals.ShaderManager;
 import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
@@ -19,9 +23,12 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.ItemInHandRenderer;
 import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.client.renderer.PostChain;
+import net.minecraft.client.renderer.ShaderInstance;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.GameType;
+import org.jetbrains.annotations.Nullable;
 import org.joml.Quaternionf;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -49,10 +56,26 @@ public abstract class MixinGameRenderer {
 
     @Shadow
     @Final
-    private Minecraft minecraft;
+    Minecraft minecraft;
 
-    @Shadow
-    public abstract float getDepthFar();
+    @Inject(method = "render", at = @At("HEAD"))
+    public void renderHead(DeltaTracker deltaTracker, boolean bl, CallbackInfo ci) {
+        LocalPlayer player = Minecraft.getInstance().player;
+
+        if (Flashback.RECORDER != null && player != null) {
+            float partialTick = deltaTracker.getGameTimeDeltaPartialTick(true);
+            Flashback.RECORDER.trackPartialPosition(player, partialTick);
+        }
+
+        AccurateEntityPositionHandler.apply(Minecraft.getInstance().level, deltaTracker);
+    }
+
+    @Inject(method = "render", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/systems/RenderSystem;clear(IZ)V", remap = false, ordinal = 0), cancellable = true)
+    public void render_noGui(DeltaTracker deltaTracker, boolean bl, CallbackInfo ci) {
+        if (Flashback.isExporting() && Flashback.EXPORT_JOB.getSettings().noGui()) {
+            ci.cancel();
+        }
+    }
 
     @WrapOperation(method = "renderItemInHand", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/multiplayer/MultiPlayerGameMode;getPlayerMode()Lnet/minecraft/world/level/GameType;"))
     public GameType getPlayerMode(MultiPlayerGameMode instance, Operation<GameType> original) {
@@ -86,24 +109,6 @@ public abstract class MixinGameRenderer {
     public Quaternionf renderLevel(Camera instance, Operation<Quaternionf> original) {
         return CameraRotation.modifyViewQuaternion(original.call(instance));
     }
-
-//    @Inject(method = "getProjectionMatrix", at = @At(value = "INVOKE", target = "Lorg/joml/Matrix4f;perspective(FFFF)Lorg/joml/Matrix4f;", shift = At.Shift.BEFORE))
-//    @Inject(method = "getProjectionMatrix", at = @At(value = "RETURN"))
-//    public void getProjectionMatrix(double d, CallbackInfoReturnable<Matrix4f> cir) {
-//        if (ReplayVisuals.overrideZoom) {
-//            cir.getReturnValue().scaleLocal(ReplayVisuals.overrideZoomAmount, ReplayVisuals.overrideZoomAmount, 1.0f);
-//        }
-//    }
-
-//    @Inject(method = "getProjectionMatrix", at = @At(value = "RETURN"), cancellable = true)
-//    public void getProjectionMatrix(double d, CallbackInfoReturnable<Matrix4f> cir) {
-//        if (ReplayVisuals.overrideZoom) {
-//            Window window = Minecraft.getInstance().getWindow();
-//            Matrix4f matrix4f = new Matrix4f().setOrtho(-10.0f, 10.0f, -10.0f, 10.0f, 0.05f, this.getDepthFar());
-//            cir.setReturnValue(matrix4f);
-////            cir.setReturnValue(new Matrix4f().ortho());
-//        }
-//    }
 
     @Inject(method = "tryTakeScreenshotIfNeeded", at = @At("HEAD"), cancellable = true)
     public void tryTakeScreenshotIfNeeded(CallbackInfo ci) {

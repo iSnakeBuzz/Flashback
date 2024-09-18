@@ -1,21 +1,27 @@
 package com.moulberry.flashback.keyframe;
 
-public enum KeyframeType {
+import com.moulberry.flashback.keyframe.handler.KeyframeHandler;
+import com.moulberry.flashback.state.KeyframeTrack;
+import org.jetbrains.annotations.Nullable;
 
-    CAMERA("Camera"),
-    CAMERA_ORBIT("Camera Orbit"),
-    FOV("FOV"),
-    SPEED("Speed"),
-    TIMELAPSE("Timelapse"),
-    TIME_OF_DAY("Time of day"),
-    CAMERA_SHAKE("Camera Shake");
+import java.util.function.Consumer;
 
-    public static final KeyframeType[] KEYFRAME_TYPES = values();
+public interface KeyframeType<T extends Keyframe> {
 
-    public final String name;
+    String name();
+    String id();
+    @Nullable T createDirect();
+    @Nullable KeyframeCreatePopup<T> createPopup();
 
-    KeyframeType(String name) {
-        this.name = name;
+    default boolean allowChangingInterpolationType() {
+        return true;
+    }
+    default boolean allowChangingTimelineTick() {
+        return true;
+    }
+
+    interface KeyframeCreatePopup<T extends Keyframe> {
+        @Nullable T render();
     }
 
 }

@@ -1,11 +1,16 @@
 package com.moulberry.flashback.record;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.moulberry.flashback.FlashbackGson;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 
 public class FlashbackMeta {
@@ -13,8 +18,11 @@ public class FlashbackMeta {
     public UUID replayIdentifier = UUID.randomUUID();
     public String name = "Unnamed";
     public String versionString = null;
+    public String bobbyWorldName = null;
     public int dataVersion = 0;
     public int protocolVersion = 0;
+
+    public TreeMap<Integer, ReplayMarker> replayMarkers = new TreeMap<>();
 
     public int totalTicks = -1;
     public LinkedHashMap<String, FlashbackChunkMeta> chunks = new LinkedHashMap<>();
@@ -33,9 +41,20 @@ public class FlashbackMeta {
         if (this.protocolVersion != 0) {
             meta.addProperty("protocol_version", this.protocolVersion);
         }
+        if (this.bobbyWorldName != null) {
+            meta.addProperty("bobby_world_name", this.bobbyWorldName);
+        }
 
         if (this.totalTicks > 0) {
             meta.addProperty("total_ticks", this.totalTicks);
+        }
+
+        if (!this.replayMarkers.isEmpty()) {
+            JsonObject jsonMarkers = new JsonObject();
+            for (Map.Entry<Integer, ReplayMarker> entry : this.replayMarkers.entrySet()) {
+                jsonMarkers.add(""+entry.getKey(), FlashbackGson.COMPRESSED.toJsonTree(entry.getValue()));
+            }
+            meta.add("markers", jsonMarkers);
         }
 
         JsonObject chunksJson = new JsonObject();
@@ -72,10 +91,23 @@ public class FlashbackMeta {
         if (meta.has("protocol_version")) {
             flashbackMeta.protocolVersion = meta.get("protocol_version").getAsInt();
         }
+        if (meta.has("bobby_world_name")) {
+            flashbackMeta.bobbyWorldName = meta.get("bobby_world_name").getAsString();
+        }
 
         // Total ticks
         if (meta.has("total_ticks")) {
             flashbackMeta.totalTicks = meta.get("total_ticks").getAsInt();
+        }
+
+        if (meta.has("markers")) {
+            JsonObject markers = meta.getAsJsonObject("markers");
+            for (Map.Entry<String, JsonElement> entry : markers.entrySet()) {
+                try {
+                    int tick = Integer.parseInt(entry.getKey());
+                    flashbackMeta.replayMarkers.put(tick, FlashbackGson.COMPRESSED.fromJson(entry.getValue(), ReplayMarker.class));
+                } catch (Exception ignored) {}
+            }
         }
 
         // Chunks

@@ -63,7 +63,12 @@ public abstract class MixinLevelChunk extends ChunkAccess implements LevelChunkE
     @Override
     public void flashback$setBlockStateWithoutUpdates(BlockPos blockPos, BlockState blockState) {
         int y = blockPos.getY();
-        LevelChunkSection levelChunkSection = this.getSection(this.getSectionIndex(y));
+        int sectionY = this.getSectionIndex(y);
+        if (sectionY < 0 || sectionY >= this.getSectionsCount()) {
+            return;
+        }
+
+        LevelChunkSection levelChunkSection = this.getSection(sectionY);
         boolean oldHasOnlyAir = levelChunkSection.hasOnlyAir();
         if (oldHasOnlyAir && blockState.isAir()) {
             return;
@@ -77,6 +82,8 @@ public abstract class MixinLevelChunk extends ChunkAccess implements LevelChunkE
         if (oldBlockState == blockState) {
             return;
         }
+
+        this.cachedChunkId = -1;
 
         // Update heightmaps
         this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING).update(localX, y, localZ, blockState);

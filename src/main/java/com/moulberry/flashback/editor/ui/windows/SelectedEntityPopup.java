@@ -1,7 +1,9 @@
 package com.moulberry.flashback.editor.ui.windows;
 
+import com.moulberry.flashback.editor.ui.ImGuiHelper;
 import com.moulberry.flashback.state.EditorState;
 import imgui.ImGui;
+import imgui.type.ImString;
 import net.minecraft.client.Minecraft;
 import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.world.entity.Entity;
@@ -19,6 +21,7 @@ public class SelectedEntityPopup {
         if (ImGui.button("Look At")) {
             Minecraft.getInstance().cameraEntity.lookAt(EntityAnchorArgument.Anchor.EYES, entity.getEyePosition());
         }
+        ImGui.sameLine();
         if (ImGui.button("Spectate")) {
             Minecraft.getInstance().player.connection.sendUnsignedCommand("spectate " + entity.getUUID());
             ImGui.closeCurrentPopup();
@@ -32,11 +35,18 @@ public class SelectedEntityPopup {
             editorState.audioSourceEntity = entity.getUUID();
             editorState.markDirty();
         }
+        boolean isHiddenDuringExport = editorState.hideDuringExport.contains(entity.getUUID());
+        if (ImGui.checkbox("Hide During Export", isHiddenDuringExport)) {
+            if (isHiddenDuringExport) {
+                editorState.hideDuringExport.remove(entity.getUUID());
+            } else {
+                editorState.hideDuringExport.add(entity.getUUID());
+            }
+            editorState.markDirty();
+        }
 
 //        ImGui.sameLine();
 //        ImGui.button("Track Entity");
-//
-//        ImGui.checkbox("Hide During Export", false);
 //
 //        ImGui.checkbox("Force Glowing", false);
 //        ImGui.sameLine();

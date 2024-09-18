@@ -1,9 +1,24 @@
 package com.moulberry.flashback.exporting;
 
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.pipeline.TextureTarget;
+import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.platform.TextureUtil;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vertex.BufferBuilder;
+import com.mojang.blaze3d.vertex.BufferUploader;
+import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormat;
+import com.moulberry.flashback.visuals.ShaderManager;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.ShaderInstance;
 import org.jetbrains.annotations.Nullable;
+import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL30C;
+import org.lwjgl.opengl.GL32C;
 
-import java.nio.ByteBuffer;
+import java.io.IOException;
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,9 +33,12 @@ public class SaveableFramebufferQueue implements AutoCloseable {
     private final List<SaveableFramebuffer> available = new ArrayList<>();
     private final List<SaveableFramebuffer> waiting = new ArrayList<>();
 
+    private final RenderTarget flipBuffer;
+
     public SaveableFramebufferQueue(int width, int height) {
         this.width = width;
         this.height = height;
+        this.flipBuffer = new TextureTarget(width, height, false, false);
 
         for (int i = 0; i < CAPACITY; i++) {
             this.available.add(new SaveableFramebuffer());
@@ -34,8 +52,45 @@ public class SaveableFramebufferQueue implements AutoCloseable {
         return this.available.removeFirst();
     }
 
-    public void startDownload(SaveableFramebuffer texture) {
-        texture.startDownload(this.width, this.height);
+    private void blitFlip(RenderTarget src, boolean supersampling) {
+        int oldFilterMode = src.filterMode;
+        if (supersampling) {
+            src.setFilterMode(GL11.GL_LINEAR);
+        }
+
+        GlStateManager._colorMask(true, true, true, true);
+        GlStateManager._disableDepthTest();
+        GlStateManager._depthMask(false);
+        GlStateManager._viewport(0, 0, src.width, src.height);
+        GlStateManager._disableBlend();
+        RenderSystem.disableCull();
+
+        this.flipBuffer.bindWrite(true);
+        ShaderInstance flipShader = ShaderManager.blitScreenFlip;
+        flipShader.setSampler("DiffuseSampler", src.colorTextureId);
+        flipShader.apply();
+        BufferBuilder bufferBuilder = RenderSystem.renderThreadTesselator().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLIT_SCREEN);
+        bufferBuilder.addVertex(0.0F, 1.0F, 0.0F);
+        bufferBuilder.addVertex(1.0F, 1.0F, 0.0F);
+        bufferBuilder.addVertex(1.0F, 0.0F, 0.0F);
+        bufferBuilder.addVertex(0.0F, 0.0F, 0.0F);
+        BufferUploader.draw(bufferBuilder.buildOrThrow());
+        flipShader.clear();
+
+        GlStateManager._depthMask(true);
+        GlStateManager._colorMask(true, true, true, true);
+        RenderSystem.enableCull();
+
+        if (supersampling) {
+            src.setFilterMode(oldFilterMode);
+        }
+    }
+
+    public void startDownload(RenderTarget target, SaveableFramebuffer texture, boolean supersampling) {
+        // Do an inline flip
+        this.blitFlip(target, supersampling);
+
+        texture.startDownload(this.flipBuffer, this.width, this.height);
         this.waiting.add(texture);
     }
 
@@ -70,6 +125,7 @@ public class SaveableFramebufferQueue implements AutoCloseable {
         }
         this.waiting.clear();
         this.available.clear();
+        this.flipBuffer.destroyBuffers();
     }
 
 
